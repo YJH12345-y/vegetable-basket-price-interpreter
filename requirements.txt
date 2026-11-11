@@ -1,0 +1,16 @@
+# 数据获取
+akshare==1.20.37
+tushare==1.4.29
+
+# 数据处理
+numpy==2.5.3
+pandas==3.0.6
+
+# 可视化
+matplotlib==3.11.2
+
+# 机器学习（预测模型）
+scikit-learn==1.9.1
+
+# Jupyter Notebook 支持
+ipykernel==7.4.0
