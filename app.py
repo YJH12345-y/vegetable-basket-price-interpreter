@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """菜篮子价格解读器 — Streamlit 版（可直接部署到 Streamlit Cloud）
-数据：
+
+数据（已打包进仓库，应用启动即读，不依赖外网抓取）：
   data/cat_*.csv      14 个品类历史价格（期货/指数，已折算为 元/公斤）
   data/realtime.json  当日批发市场价格（农业农村部 pfsc.agri.cn）
-说明：本地运行 fetch_hist.py / fetch_realtime.py 可刷新数据后重新部署。
+
+兼容说明：数据文件既可能在 data/ 子目录，也可能在仓库根目录；
+本程序会按「data/ → 根目录 → 仓库在线 raw」的顺序查找，任一处存在即可。
 """
 import os
+import io
 import json
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -15,6 +20,9 @@ import streamlit as st
 
 WS = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(WS, "data")
+
+# 仓库在线 raw 地址（兜底：本地找不到时从 GitHub 拉，需联网）
+RAW_BASE = "https://raw.githubusercontent.com/YJH12345-y/vegetable-basket-price-interpreter/main"
 
 # ── 品类定义：key, emoji, 展示名, 折算系数（原始单位 -> 元/公斤）────────────
 META = [
@@ -45,15 +53,41 @@ REGIONS = [
          why="冬季寒冷依赖外运与大棚，鲜菜季节性价差大"),
 ]
 
-WANTED = ["猪肉", "牛肉", "羊肉", "鸡蛋", "白条鸡", "鲤鱼", "大带鱼", "大黄花鱼",
-          "花鲢活鱼", "草鱼", "鲫鱼", "白鲢鱼", "油菜", "芹菜", "大白菜", "土豆",
-          "黄瓜", "西红柿", "茄子", "青椒", "苹果", "香蕉", "富士苹果"]
+
+def _remote_text(rel):
+    """从仓库在线 raw 拉取文本；失败返回 None。"""
+    try:
+        req = urllib.request.Request(
+            f"{RAW_BASE}/{rel}",
+            headers={"User-Agent": "streamlit-app"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.read().decode("utf-8")
+    except Exception:
+        return None
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_hist(key, conv):
-    """读取某品类历史 CSV，返回 (df, 最新价, 历史分位%, 近30日涨跌%)。"""
-    df = pd.read_csv(os.path.join(DATA, f"cat_{key}.csv"))
+    """读取某品类历史 CSV，返回 (df, 最新价, 历史分位%, 近30日涨跌%)。
+    查找顺序：data/cat_{key}.csv → 根目录 cat_{key}.csv → 在线 raw。"""
+    local_cands = [
+        os.path.join(DATA, f"cat_{key}.csv"),
+        os.path.join(WS, f"cat_{key}.csv"),
+    ]
+    text = None
+    for p in local_cands:
+        if os.path.exists(p):
+            text = open(p, encoding="utf-8").read()
+            break
+    if text is None:
+        text = _remote_text(f"cat_{key}.csv")
+        if text is None:
+            text = _remote_text(f"data/cat_{key}.csv")
+    if not text:
+        return pd.DataFrame(), None, None, None
+
+    df = pd.read_csv(io.StringIO(text))
     df = df.dropna()
     df["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
     df["price"] = pd.to_numeric(df.iloc[:, 1], errors="coerce") * conv
@@ -68,12 +102,25 @@ def load_hist(key, conv):
     return df, round(last, 2), round(pct), chg30
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_realtime():
-    path = os.path.join(DATA, "realtime.json")
-    if not os.path.exists(path):
-        return {}
-    return json.load(open(path, encoding="utf-8"))
+    """读取当日价格；查找顺序：data/realtime.json → 根目录 realtime.json → 在线 raw。"""
+    local_cands = [
+        os.path.join(DATA, "realtime.json"),
+        os.path.join(WS, "realtime.json"),
+    ]
+    for p in local_cands:
+        if os.path.exists(p):
+            return json.load(open(p, encoding="utf-8"))
+    txt = _remote_text("realtime.json")
+    if txt is None:
+        txt = _remote_text("data/realtime.json")
+    if txt:
+        try:
+            return json.loads(txt)
+        except Exception:
+            return {}
+    return {}
 
 
 def find_price(items, name, default):
@@ -123,7 +170,7 @@ def main():
                 use_container_width=True, hide_index=True,
             )
         else:
-            st.info("未找到当日价格数据，请确认 data/realtime.json 已上传。")
+            st.info("未找到当日价格数据，请确认 realtime.json 已上传到仓库根目录或 data/ 文件夹。")
 
     # 农产品批发价格指数
     indices = rt.get("indices", []) or []
@@ -169,7 +216,7 @@ def main():
 
     df, last, pct, chg30 = load_hist(key, conv)
     if df.empty:
-        st.warning(f"未找到 {name} 的历史数据文件 data/cat_{key}.csv")
+        st.warning(f"未找到 {name} 的历史数据文件 cat_{key}.csv（请放在仓库根目录或 data/ 文件夹）")
     else:
         # 抽样，控制点数 ~400，保证流畅
         if len(df) > 400:
