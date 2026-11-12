@@ -18,6 +18,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+# 联网抓取模块（仅在有 requests 时启用手动刷新按钮）
+try:
+    import data_fetcher
+    _HAS_LIVE = True
+except Exception:
+    _HAS_LIVE = False
+
 WS = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(WS, "data")
 
@@ -141,6 +148,27 @@ def find_item(items, name, default_price):
     return default_price, 0.0
 
 
+# 常见品类缺数据时的参考价（元/公斤）
+_DEFAULT_PRICE = {
+    "猪肉": 15, "牛肉": 60, "羊肉": 60, "鸡蛋": 9.5, "白条鸡": 18, "大白菜": 3,
+    "土豆": 3.5, "西红柿": 6, "黄瓜": 5, "芹菜": 3, "茄子": 5, "粳米": 6,
+    "豆油": 11, "苹果": 8, "香蕉": 5, "鲤鱼": 14, "草鱼": 16,
+}
+
+
+def _default_price(name):
+    return _DEFAULT_PRICE.get(name, 10.0)
+
+
+def price_and_src(items, name, default):
+    """返回 (价格, 来源)；实时价命中返回「实时」，否则用参考价返回「参考」。"""
+    for it in items:
+        n = it.get("name", "")
+        if name in n or n in name:
+            return float(it["price"]), "实时"
+    return default, "参考"
+
+
 # 每人每月参考消费量（公斤/月）与默认参考价（数据缺失时回退）
 _BASKET_BASE = [
     ("猪肉", 2.5, 15.0),
@@ -196,7 +224,25 @@ def main():
     profile = st.sidebar.selectbox("家庭饮食偏好", list(_PROFILES.keys()), index=0,
                                    key="profile")
 
-    rt = load_realtime()
+    # ───────── 实时刷新（手动联网获取最新价）─────────
+    if _HAS_LIVE:
+        if st.button("🔄 刷新实时数据（联网获取最新）", key="refresh_live",
+                     help="尝试从农业农村部接口获取最新菜价；失败则继续使用内置数据"):
+            with st.spinner("正在联网获取最新菜价…"):
+                try:
+                    live = data_fetcher.fetch_all()
+                except Exception as e:
+                    live = None
+                    st.warning(f"联网获取失败：{e}")
+            if live and len(live.get("growth", [])) > 0:
+                st.session_state["live_rt"] = live
+                st.success("已更新为最新实时数据 ✅（本次会话内生效，每天也会自动更新）")
+                st.rerun()
+            elif live is not None:
+                st.warning("联网获取到空数据，已继续使用内置数据。")
+
+    # 优先用本次会话手动刷到的最新数据，否则用仓库内置/在线数据
+    rt = st.session_state.get("live_rt") or load_realtime()
     fetch_time = rt.get("fetch_time", "未知")
     report_date = rt.get("report_date", "")
 
@@ -207,6 +253,7 @@ def main():
         st.metric("数据更新时间", fetch_time)
         if report_date:
             st.caption(f"周度均价基准日：{report_date}")
+        st.caption("🗓️ 数据每日自动更新；也可点上方按钮手动刷新")
 
     # 合并当日价与周均价，去重（优先保留带环比的当日价）
     raw = (rt.get("growth", []) or []) + (rt.get("report", []) or [])
@@ -317,6 +364,97 @@ def main():
         else:
             verdict = "菜篮子支出已占收入较大比重，物价上涨会明显加重生活压力，建议优先囤米面油等耐储品类。"
         st.info(f"{impact_txt}\n\n{verdict}")
+
+    # ───────── 模块五：家庭食品采购计划（互动）─────────
+    if today:
+        st.header("🥗 家庭食品采购计划", divider="green")
+        st.markdown("规划您家一个月想买的菜和大致用量，自动按今日批发价估算花费，并对照家庭月收入。")
+
+        # 预设模板（套用后可继续手动增删改）
+        TEMPLATES = {
+            "标准家庭": [("猪肉", 2.5), ("鸡蛋", 1.5), ("白条鸡", 1.0), ("大白菜", 4.0),
+                       ("土豆", 3.0), ("西红柿", 2.0), ("黄瓜", 2.0), ("芹菜", 1.5),
+                       ("粳米", 6.0), ("豆油", 1.0), ("苹果", 2.0), ("香蕉", 2.0)],
+            "有孩/老人·清淡": [("猪肉", 2.0), ("鸡蛋", 1.5), ("白条鸡", 0.8), ("大白菜", 5.0),
+                             ("土豆", 4.0), ("西红柿", 3.0), ("黄瓜", 3.0), ("芹菜", 2.0),
+                             ("茄子", 2.0), ("粳米", 6.5), ("苹果", 2.5), ("香蕉", 2.5)],
+            "肉食偏好": [("猪肉", 3.5), ("鸡蛋", 1.5), ("白条鸡", 1.5), ("牛肉", 1.5), ("羊肉", 1.0),
+                        ("大白菜", 3.0), ("土豆", 3.0), ("西红柿", 2.0), ("黄瓜", 2.0),
+                        ("粳米", 6.0), ("豆油", 1.0)],
+        }
+        # 下拉可选项：今日实时品类 + 所有模板用到的品类（避免默认项显示异常）
+        _tpl_names = {n for items in TEMPLATES.values() for n, _ in items}
+        opts = sorted({t["name"] for t in today} | _tpl_names)
+
+        tcols = st.columns(len(TEMPLATES))
+        for i, (tname, items) in enumerate(TEMPLATES.items()):
+            if tcols[i].button(f"套用「{tname}」", key=f"tpl_{tname}"):
+                st.session_state["food_plan"] = pd.DataFrame(
+                    [{"品类": n, "每月用量(公斤)": q} for n, q in items])
+                st.rerun()
+
+        if "food_plan" not in st.session_state or st.session_state["food_plan"] is None:
+            st.session_state["food_plan"] = pd.DataFrame(
+                [{"品类": n, "每月用量(公斤)": q} for n, q in TEMPLATES["标准家庭"]])
+
+        edited = st.data_editor(
+            st.session_state["food_plan"],
+            num_rows="dynamic",
+            key="food_editor",
+            column_config={
+                "品类": st.column_config.SelectboxColumn("品类", options=opts, width="medium"),
+                "每月用量(公斤)": st.column_config.NumberColumn(
+                    "每月用量(公斤)", min_value=0.0, step=0.5, width="small"),
+            },
+            use_container_width=True, hide_index=True,
+        )
+        st.session_state["food_plan"] = edited
+
+        # 计算每月花费
+        rows, total, any_ref = [], 0.0, False
+        for _, r in edited.iterrows():
+            name = str(r["品类"]).strip()
+            qty = float(r["每月用量(公斤)"] or 0)
+            if not name or qty <= 0:
+                continue
+            price, src = price_and_src(today, name, _default_price(name))
+            cost = price * qty
+            total += cost
+            if src == "参考":
+                any_ref = True
+            rows.append(dict(品类=name, 单价=round(price, 2), 来源=src, 月支出=round(cost, 1)))
+
+        if rows:
+            df_plan = pd.DataFrame(rows)
+            daily = total / 30
+            ratio = total / max(income, 1)
+            p1, p2, p3 = st.columns(3)
+            p1.metric("🧾 计划每月菜钱", f"¥{total:,.0f}")
+            p2.metric("📅 折合每天", f"¥{daily:,.1f}")
+            p3.metric("📊 占家庭月收入", f"{ratio*100:.1f}%",
+                      "比重越低越轻松" if ratio < 0.3 else ("比重偏高" if ratio < 0.5 else "比重较大"))
+            cL, cR = st.columns([3, 2])
+            with cL:
+                st.dataframe(df_plan, use_container_width=True, hide_index=True)
+            with cR:
+                fig3 = px.bar(df_plan, x="品类", y="月支出", title="各品类每月花费",
+                              color="月支出", color_continuous_scale="Tealgrn")
+                fig3.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=320)
+                st.plotly_chart(fig3, use_container_width=True)
+            if any_ref:
+                st.caption("⚠️ 标注「参考」的品类今日实时价缺失，使用了估算参考价，实际以市场为准。")
+            if ratio < 0.15:
+                v = "这份采购计划占收入比重很低，安排得很宽裕。"
+            elif ratio < 0.3:
+                v = "采购计划占收入比重合理，日常可轻松承担。"
+            elif ratio < 0.5:
+                v = "采购计划占收入比重偏高，可适当减少高价肉禽或寻找平价替代品。"
+            else:
+                v = "采购计划已占收入较大比重，建议优先保证米面油等刚需、精简高价品类。"
+            st.info(f"按今日价格，您家一个月买这些菜大约花 **¥{total:,.0f}**（每天约 ¥{daily:,.1f}），"
+                    f"占家庭月收入 **{ratio*100:.1f}%**。\n\n{v}")
+        else:
+            st.info("请在上方表格里至少添加一行「品类 + 每月用量」，或点上方模板套用。")
 
     # ───────── 模块二：历史价格走势 ─────────
     st.header("📈 历史价格走势", divider="green")
