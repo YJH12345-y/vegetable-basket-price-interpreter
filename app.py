@@ -132,10 +132,69 @@ def find_price(items, name, default):
     return default
 
 
+def find_item(items, name, default_price):
+    """返回 (价格, 环比%)；按名称模糊匹配，未匹配则用默认价、环比记 0。"""
+    for it in items:
+        n = it.get("name", "")
+        if name in n or n in name:
+            return float(it["price"]), float(it.get("hbs", 0))
+    return default_price, 0.0
+
+
+# 每人每月参考消费量（公斤/月）与默认参考价（数据缺失时回退）
+_BASKET_BASE = [
+    ("猪肉", 2.5, 15.0),
+    ("鸡蛋", 1.5, 9.5),
+    ("白条鸡", 1.0, 18.0),
+    ("大白菜", 4.0, 3.0),
+    ("茄子", 2.0, 5.0),
+    ("芹菜", 1.5, 3.0),
+    ("香蕉", 2.0, 5.0),
+    ("粳米", 6.0, 6.0),
+    ("豆油", 1.0, 11.0),
+]
+
+# 饮食偏好对各类用量的缩放系数
+_PROFILES = {
+    "标准家庭": {},
+    "有孩/老人·清淡": {"猪肉": 0.8, "白条鸡": 0.8, "大白菜": 1.3, "茄子": 1.3,
+                        "芹菜": 1.3, "鸡蛋": 1.2, "香蕉": 1.1, "粳米": 1.1},
+    "肉食偏好": {"猪肉": 1.4, "白条鸡": 1.4, "大白菜": 0.9, "茄子": 0.9, "芹菜": 0.9},
+}
+
+
+def family_basket(today, profile="标准家庭"):
+    """计算家庭菜篮子：返回 (每人每月支出, 每日每人涨跌影响, 明细DataFrame)。
+    明细含 品类/用量/单价/月支出/今日日影响。"""
+    fac = _PROFILES.get(profile, {})
+    rows, per_person_month, per_person_day_delta = [], 0.0, 0.0
+    for name, qty, default in _BASKET_BASE:
+        price, hbs = find_item(today, name, default)
+        q = qty * fac.get(name, 1.0)
+        month_cost = price * q                       # 每人每月支出（q 已是月度用量）
+        yest = price / (1 + hbs / 100) if hbs != 0 else price
+        day_delta = (price - yest) * (q / 30)        # 每人每日影响（元/天）
+        per_person_month += month_cost
+        per_person_day_delta += day_delta
+        rows.append(dict(品类=name, 用量_kg=round(q, 2), 单价=round(price, 2),
+                         月支出=round(month_cost, 1), 今日日影响=round(day_delta, 3)))
+    return per_person_month, per_person_day_delta, pd.DataFrame(rows)
+
+
 def main():
     st.set_page_config(page_title="菜篮子价格解读器", page_icon="🧺", layout="wide")
     st.title("🧺 菜篮子价格解读器")
     st.caption("基于农业农村部批发市场价格 + 期货历史数据，帮你读懂每天的「菜篮子」")
+
+    # ───────── 侧边栏：我的家庭（互动输入）─────────
+    st.sidebar.header("🏠 我的家庭")
+    st.sidebar.caption("填入您家情况，下方自动测算物价影响")
+    income = st.sidebar.number_input("家庭月总收入（元）", min_value=0,
+                                     value=8000, step=500, key="income")
+    members = st.sidebar.number_input("家庭人口（人）", min_value=1, max_value=20,
+                                      value=3, step=1, key="members")
+    profile = st.sidebar.selectbox("家庭饮食偏好", list(_PROFILES.keys()), index=0,
+                                   key="profile")
 
     rt = load_realtime()
     fetch_time = rt.get("fetch_time", "未知")
@@ -206,6 +265,58 @@ def main():
             st.markdown("**🔻 今日领跌**")
             for t in downs:
                 st.markdown(f"- {t['name']}　{t['price']} 元/公斤　`{t['hbs']}%`")
+
+    # ───────── 模块四：我的家庭影响测算（互动）─────────
+    if today:
+        st.header("💡 我的家庭影响测算", divider="green")
+        st.markdown(f"按您在左侧填写的 **{members} 人家庭 / 月收入 ¥{income:,.0f} / "
+                    f"{profile}**，结合今日批发价，自动测算物价对您家的影响。")
+
+        per_person_month, per_person_day, df_basket = family_basket(today, profile)
+        fam_month = per_person_month * members
+        fam_day_delta = per_person_day * members
+        fam_month_delta = fam_day_delta * 30
+        ratio = fam_month / max(income, 1)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("🛒 家庭每月菜篮子支出", f"¥{fam_month:,.0f}",
+                  f"按 {members} 人 × 今日价折算")
+        m2.metric("📊 占月收入比例", f"{ratio*100:.1f}%",
+                  "比重越低越轻松" if ratio < 0.3 else ("比重偏高" if ratio < 0.5 else "比重较大"))
+        sign = "🔺多花" if fam_day_delta >= 0 else "🔻少花"
+        m3.metric("🌡️ 今日物价对您家影响", f"{sign} ¥{abs(fam_day_delta):.2f}/天",
+                  f"按月约{'多花' if fam_month_delta >= 0 else '少花'} ¥{abs(fam_month_delta):.0f}")
+
+        # 分品类明细 + 柱状图
+        c_left, c_right = st.columns([3, 2])
+        with c_left:
+            st.dataframe(df_basket.rename(columns={
+                "品类": "品类", "用量_kg": "用量(公斤/月·人)", "单价": "单价(元/公斤)",
+                "月支出": "月支出(元/人)", "今日日影响": "今日日影响(元/人)"}),
+                use_container_width=True, hide_index=True)
+        with c_right:
+            fig2 = px.bar(df_basket, x="品类", y="月支出",
+                          title="各类别每月支出（每人）", color="月支出",
+                          color_continuous_scale="Tealgrn")
+            fig2.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=300)
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # 结论文案
+        if fam_day_delta >= 0:
+            impact_txt = (f"与昨日相比，今天的菜价让您的家庭每天大约**多花 ¥{fam_day_delta:.2f}**"
+                          f"（按月约 ¥{fam_month_delta:.0f}）。")
+        else:
+            impact_txt = (f"与昨日相比，今天的菜价让您的家庭每天大约**少花 ¥{abs(fam_day_delta):.2f}**"
+                          f"（按月约省 ¥{abs(fam_month_delta):.0f}）。")
+        if ratio < 0.15:
+            verdict = "菜篮子支出占收入比重很低，日常物价波动对您家影响很小，可以放宽心。"
+        elif ratio < 0.3:
+            verdict = "菜篮子支出占收入比重处于合理区间，物价波动在可承受范围内。"
+        elif ratio < 0.5:
+            verdict = "菜篮子支出占收入比重偏高，建议多关注领涨品类、错峰采购或选性价比更高的替代品。"
+        else:
+            verdict = "菜篮子支出已占收入较大比重，物价上涨会明显加重生活压力，建议优先囤米面油等耐储品类。"
+        st.info(f"{impact_txt}\n\n{verdict}")
 
     # ───────── 模块二：历史价格走势 ─────────
     st.header("📈 历史价格走势", divider="green")
