@@ -107,6 +107,63 @@ PERSONAS = {
         meat_w=0.7, staple_w=1.2, fruit_w=0.8, veg_w=1.1)),
 }
 
+# ── 背景主题：每个画像一套底色 + 花纹 ──────────────────────────────
+# ink_rgb 用于生成淡雅花纹，c1/c2 是主渐变，side 是侧边栏底色
+THEMES = {
+    "标准家庭": dict(c1="#FFF9ED", c2="#F2E8D5", side="#EFE4CE",
+                  ink="#2F7A5B", ink_rgb="47,122,91", pattern="dots"),
+    "有娃家庭": dict(c1="#FFF6DF", c2="#FFE9B8", side="#FBE3AD",
+                  ink="#C2661E", ink_rgb="194,102,30", pattern="dots"),
+    "银发二人组": dict(c1="#EEF8F3", c2="#DCEFE5", side="#D4E9DE",
+                   ink="#2F7A5B", ink_rgb="47,122,91", pattern="grid"),
+    "独居青年": dict(c1="#F5F0FC", c2="#E6DCF5", side="#DFD2EF",
+                  ink="#6B4FA0", ink_rgb="107,79,160", pattern="stripes"),
+    "健身增肌党": dict(c1="#FFF2EE", c2="#FADFD6", side="#F5D3C8",
+                   ink="#B0453A", ink_rgb="176,69,58", pattern="chevron"),
+    "肉食爱好者": dict(c1="#FCF0EA", c2="#F2DCD0", side="#EBD0C2",
+                   ink="#964636", ink_rgb="150,70,54", pattern="waves"),
+    "极简省钱派": dict(c1="#F3F6F0", c2="#E5EBDF", side="#DDE5D5",
+                   ink="#4A6B3D", ink_rgb="74,107,61", pattern="grid"),
+}
+
+PATTERN_LABEL = {
+    "dots": "圆点", "grid": "网格", "stripes": "斜纹",
+    "chevron": "人字纹", "waves": "波纹",
+}
+
+
+def _pattern_css(kind, color):
+    """返回 (background-image 值, background-size 值)。"""
+    if kind == "dots":
+        return f"radial-gradient({color} 1.4px, transparent 1.5px)", "26px 26px"
+    if kind == "grid":
+        return (f"linear-gradient({color} 1px, transparent 1px),"
+                f"linear-gradient(90deg, {color} 1px, transparent 1px)"), "34px 34px"
+    if kind == "stripes":
+        return (f"repeating-linear-gradient(45deg, transparent 0, transparent 16px,"
+                f" {color} 16px, {color} 18px)"), "auto"
+    if kind == "chevron":
+        return (f"repeating-linear-gradient(135deg, transparent 0, transparent 14px,"
+                f" {color} 14px, {color} 16px)"), "auto"
+    if kind == "waves":
+        return (f"radial-gradient(circle at 18% 12%, {color} 0, transparent 36%),"
+                f"radial-gradient(circle at 82% 88%, {color} 0, transparent 40%)"), "auto"
+    return "none", "auto"
+
+
+def theme_css(name):
+    """生成整页主题 CSS（单行，避免 React removeChild 报错）。"""
+    t = THEMES.get(name, THEMES["标准家庭"])
+    img, size = _pattern_css(t["pattern"], f"rgba({t['ink_rgb']},0.07)")
+    base = f"linear-gradient(135deg,{t['c1']} 0%,{t['c2']} 100%)"
+    return (
+        f'<style>.stApp{{background:{base};background-image:{img},{base};'
+        f'background-size:{size},cover;background-attachment:fixed;}}'
+        f'section[data-testid="stSidebar"]{{background:{t["side"]};}}'
+        f'h1{{color:{t["ink"]};}}</style>'
+    )
+
+
 # 每人每月参考消费量（公斤/月·人）与分组
 _BASKET_BASE = [
     ("猪肉",   2.5, 15.0, "肉蛋"),
@@ -176,6 +233,125 @@ def load_hist(key, conv):
     chg30 = round((last / prices[max(0, len(prices) - 31)] - 1) * 100, 1) if len(prices) > 31 else 0.0
     df["ma30"] = df["price"].rolling(30).mean()
     return df, round(last, 2), round(pct), chg30
+
+
+# ═══════════════════════════ 深度分析引擎 ═══════════════════════════
+def _load_all_hist():
+    """一次性读取全部品类历史，返回 {展示名: DataFrame}。"""
+    out = {}
+    for key, emoji, name, conv in META:
+        df, _, _, _ = load_hist(key, conv)
+        if not df.empty:
+            out[name] = df
+    return out
+
+
+load_all_hist = st.cache_data(show_spinner=False)(_load_all_hist)
+
+
+def _seasonal_matrix():
+    """品类 × 月份 的历史均价矩阵（按各自全样本月份归集）。"""
+    data = {}
+    for name, df in _load_all_hist().items():
+        s = df.set_index("date")["price"].resample("MS").mean()
+        bymonth = s.groupby(s.index.month).mean()
+        if len(bymonth) == 12:
+            data[name] = bymonth
+    mat = pd.DataFrame(data).T
+    mat.columns = [f"{m}月" for m in mat.columns]
+    return mat
+
+
+seasonal_matrix = st.cache_data(show_spinner=False)(_seasonal_matrix)
+
+
+def _corr_matrix():
+    """品类月度收益率相关矩阵（min_periods=24，避免短样本误判）。"""
+    series = {}
+    for name, df in _load_all_hist().items():
+        s = df.set_index("date")["price"].resample("MS").mean().pct_change()
+        series[name] = s
+    return pd.DataFrame(series).corr(min_periods=24)
+
+
+corr_matrix = st.cache_data(show_spinner=False)(_corr_matrix)
+
+
+def risk_metrics(df):
+    """返回 (年化波动率%, 最大回撤%, 近一年涨跌%)。"""
+    s = df.set_index("date")["price"].sort_index()
+    daily = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    vol = float(daily.std() * np.sqrt(252) * 100) if len(daily) > 30 else float("nan")
+    mdd = float((s / s.cummax() - 1).min() * 100)
+    cutoff = s.index.max() - pd.Timedelta(days=365)
+    yr = s[s.index >= cutoff]
+    yoy = float((yr.iloc[-1] / yr.iloc[0] - 1) * 100) if len(yr) > 20 else float("nan")
+    return vol, mdd, yoy
+
+
+def value_map(allh):
+    """全品类估值地图：当前价在各自历史中的位置。"""
+    rows = []
+    for name, df in allh.items():
+        last = float(df["price"].iloc[-1])
+        pct = float((df["price"] < last).mean() * 100)
+        yr = df[df["date"] >= df["date"].max() - pd.Timedelta(days=365)]["price"]
+        avg1 = float(yr.mean()) if len(yr) else last
+        rows.append(dict(品类=name, 历史分位=pct, 最新价=round(last, 2),
+                         近一年均价=round(avg1, 2),
+                         偏离均价=round((last / avg1 - 1) * 100, 1) if avg1 else 0.0))
+    return pd.DataFrame(rows).sort_values("历史分位").reset_index(drop=True)
+
+
+def forecast_price(df, horizon=30):
+    """课程级线性回归外推：返回 (预测价, 下界, 上界, 日斜率, 样本天数)。"""
+    y = df["price"].to_numpy(dtype=float)
+    n = min(120, len(y))
+    y = y[-n:]
+    x = np.arange(n)
+    slope, intercept = np.polyfit(x, y, 1)
+    noise = float(np.std(y - (slope * x + intercept)))
+    pred = float(slope * (n + horizon - 1) + intercept)
+    lo = float(max(0.0, pred - 1.96 * noise))
+    hi = float(pred + 1.96 * noise)
+    return pred, lo, hi, float(slope), n
+
+
+def build_insights(allh):
+    """从历史数据自动生成 4 条有具体数字的洞察。"""
+    out = []
+    vm = value_map(allh)
+    if len(vm) >= 2:
+        c, d = vm.iloc[0], vm.iloc[-1]
+        out.append(f"🟢 **{c['品类']}** 处历史 {c['历史分位']:.0f}% 分位，是相对最便宜的品类；"
+                   f"🔴 **{d['品类']}** 在 {d['历史分位']:.0f}% 分位，处在高位。")
+
+    sm = seasonal_matrix()
+    if not sm.empty:
+        spread = (sm.max(axis=1) / sm.min(axis=1) - 1) * 100
+        name = spread.idxmax()
+        lo_m, hi_m = sm.loc[name].idxmin(), sm.loc[name].idxmax()
+        out.append(f"📅 **{name}** 季节性最强：{lo_m}均价最低、{hi_m}最高，"
+                   f"历史价差约 **{spread[name]:.0f}%**，错峰买能省一笔。")
+
+    risks = []
+    for name, df in allh.items():
+        v, mdd, _ = risk_metrics(df)
+        if np.isfinite(v):
+            risks.append((v, name, mdd))
+    risks.sort(reverse=True)
+    if risks:
+        out.append(f"🎢 **{risks[0][1]}** 年化波动率 **{risks[0][0]:.0f}%**、"
+                   f"最大回撤 {risks[0][2]:.0f}%，是价格最「过山车」的品类。")
+
+    cm = corr_matrix()
+    if cm is not None and cm.shape[0] > 2:
+        cc = cm.where(~np.eye(len(cm), dtype=bool)).stack().dropna()
+        if len(cc):
+            a, b = cc.idxmax()
+            out.append(f"🔗 **{a}** 与 **{b}** 月度价格同步性最高（r={cc.max():.2f}），"
+                       "涨价往往结伴而来。")
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -356,7 +532,7 @@ def metric_card(title, value, delta=None, unit="", up_is_good=False, note=""):
         arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "＝")
         delta_text = f"{arrow} {abs(delta):,.2f}{unit}"
     html = (
-        f'<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:14px 16px;min-height:104px;">'
+        f'<div style="background:rgba(255,255,255,0.72);border:1px solid rgba(255,255,255,0.9);border-radius:14px;padding:14px 16px;min-height:104px;box-shadow:0 2px 10px rgba(0,0,0,0.05);backdrop-filter:blur(6px);">'
         f'<div style="font-size:13px;color:#6b7280;">{title}</div>'
         f'<div style="font-size:25px;font-weight:750;color:#111827;line-height:1.25;margin:4px 0;">{value}</div>'
         f'<div style="font-size:13px;font-weight:650;color:{color};">{delta_text}</div>'
@@ -371,6 +547,12 @@ def main():
     st.set_page_config(page_title="菜篮子价格解读器", page_icon="🧺", layout="wide",
                        initial_sidebar_state="expanded")
 
+    # 主题：默认跟随当前画像，也可手动指定
+    theme_mode = st.session_state.get("theme_mode", "跟随画像")
+    active_theme = (st.session_state.get("persona_name", "标准家庭")
+                    if theme_mode == "跟随画像" else theme_mode)
+    st.markdown(theme_css(active_theme), unsafe_allow_html=True)
+
     # 初始化画像参数
     for k, v in _BASE_STATE.items():
         if k not in st.session_state:
@@ -383,6 +565,12 @@ def main():
     # ───────── 侧边栏：画像实验室 ─────────
     st.sidebar.title("🎮 画像实验室")
     st.sidebar.caption("挑个人设，再微调 5 组参数，解锁你的专属菜价剧本")
+
+    st.sidebar.selectbox("🎨 背景主题", ["跟随画像"] + list(THEMES.keys()),
+                         key="theme_mode")
+    if theme_mode == "跟随画像":
+        t = THEMES[active_theme]
+        st.sidebar.caption(f"当前花纹：**{PATTERN_LABEL[t['pattern']]}** · 随「{active_theme}」自动切换")
 
     persona_names = list(PERSONAS.keys())
     st.sidebar.selectbox("① 先挑一个初始人设", persona_names, key="persona_name")
@@ -452,6 +640,7 @@ def main():
 
     indices = rt.get("indices", []) or []
     factors, price_factor = build_factors(state)
+    allh = load_all_hist()
 
     # ───────── 顶部：今日战报 ─────────
     st.title("🧺 菜篮子价格解读器")
@@ -501,6 +690,15 @@ def main():
             badges.append("🥩 蛋白狂人")
         if badges:
             st.markdown("**🏆 已解锁成就：** " + " ｜ ".join(f"`{b}`" for b in badges))
+
+    # ───────── 数据洞察：直接从历史算出来 ─────────
+    if allh:
+        with st.container(border=True):
+            st.markdown("### 🔎 数据自己会说话")
+            st.caption("以下结论由 14 个品类、最长 20 年历史数据实时算出（期货/指数口径，"
+                       "与今日批发现价不同），不是写死的文案。")
+            for line in build_insights(allh):
+                st.markdown(f"- {line}")
 
     # ───────── 模块一：今日菜篮子 ─────────
     st.header("📅 今日菜篮子", divider="green")
@@ -625,6 +823,66 @@ def main():
         else:
             verdict = "负担较重，优先保刚需、精简高价品类，并考虑社区团购等渠道。"
         st.success(f"🎯 {impact}\n\n{verdict}")
+
+        # ── 情景压力测试 ──
+        st.markdown("#### 🎛️ 价格压力测试（What-if）")
+        st.caption("假设未来肉蛋 / 蔬果 / 米面油分别涨跌，实时推演你家菜钱的变化。")
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            meat_shock = st.slider("🥩 肉蛋涨跌 %", -30, 30, 0, 5, key="shock_meat") / 100
+        with sc2:
+            veg_shock = st.slider("🥬 蔬果涨跌 %", -30, 30, 0, 5, key="shock_veg") / 100
+        with sc3:
+            staple_shock = st.slider("🍚 米面油涨跌 %", -30, 30, 0, 5, key="shock_staple") / 100
+
+        shock_map = {"肉蛋": meat_shock, "蛋奶": meat_shock, "蔬菜": veg_shock,
+                     "水果": veg_shock, "主食": staple_shock}
+        base_fam = float(df_basket["月支出"].sum()) * members
+        scen = df_basket.copy()
+        scen["情景月支出"] = [
+            row["月支出"] * (1 + shock_map.get(row["分组"], 0.0))
+            for _, row in scen.iterrows()
+        ]
+        new_fam = float(scen["情景月支出"].sum()) * members
+        diff_fam = new_fam - base_fam
+
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            metric_card("🧾 基线月菜钱", f"¥{base_fam:,.0f}", None,
+                        note="按今日价格推算")
+        with pc2:
+            metric_card("🔮 情景月菜钱", f"¥{new_fam:,.0f}", diff_fam / 30,
+                        " 元/天", False, "较基线每天变化")
+        with pc3:
+            metric_card("💰 月度差额", f"{'+' if diff_fam >= 0 else ''}¥{diff_fam:,.0f}",
+                        diff_fam, " 元/月", False,
+                        note="涨价红 / 降价绿")
+
+        grp = scen.groupby("分组").agg(基线=("月支出", "sum"),
+                                      情景=("情景月支出", "sum")).reset_index()
+        grp["基线"] *= members
+        grp["情景"] *= members
+        fig_w = go.Figure()
+        fig_w.add_trace(go.Bar(name="基线", x=grp["分组"], y=grp["基线"],
+                               marker_color="#cbd5e1"))
+        fig_w.add_trace(go.Bar(name="情景", x=grp["分组"], y=grp["情景"],
+                               marker_color="#2F7A5B"))
+        fig_w.update_layout(
+            title="各食材组：基线 vs 情景（家庭每月）", height=330,
+            barmode="group", margin=dict(l=10, r=10, t=50, b=10),
+            legend=dict(orientation="h", y=1.12, x=0), yaxis_title="元/月")
+        st.plotly_chart(fig_w, width="stretch")
+
+        if abs(diff_fam) < 0.5:
+            st.info("当前滑块都在 0，看到的就是基线。试着拖动一个滑块，看看价格波动如何传导到你的钱包。")
+        else:
+            lead = grp.assign(变化=grp["情景"] - grp["基线"]).iloc[
+                (grp["情景"] - grp["基线"]).abs().argmax()]
+            direction = "多花" if diff_fam > 0 else "省下"
+            tone = st.warning if diff_fam > 0 else st.success
+            tone(f"{'⚠️' if diff_fam > 0 else '✅'} 这个情景下，你家每月将**{direction} "
+                 f"¥{abs(diff_fam):,.0f}**（每天约 ¥{abs(diff_fam)/30:.2f}）；"
+                 f"影响最大的是「{lead['分组']}」组，变化 {lead['情景']-lead['基线']:+,.0f} 元/月。")
 
     # ───────── 模块三：采购计划 ─────────
     if today:
@@ -760,6 +1018,161 @@ def main():
                           yaxis_title="价格(元/公斤)" if conv != 1 else "指数",
                           xaxis_title="日期")
         st.plotly_chart(fig, width="stretch")
+
+    # ───────── 模块六：深度分析实验室 ─────────
+    st.header("🔬 深度分析实验室", divider="green")
+    st.markdown("同样的数据，换五种问法：**现在贵不贵、什么时候买、风险有多大、谁跟谁一起涨、接下来怎么走**。"
+                "以下全部由仓库内历史 CSV 实时计算。")
+
+    labels6 = {m[2]: m for m in META}
+    tab_val, tab_sea, tab_risk, tab_corr, tab_fc = st.tabs(
+        ["🧭 估值地图", "📅 季节性日历", "🎢 波动风险", "🔗 联动关系", "🔮 趋势预测"])
+
+    with tab_val:
+        vm = value_map(allh)
+        if not vm.empty:
+            fig_vm = go.Figure(go.Bar(
+                x=vm["历史分位"], y=vm["品类"], orientation="h",
+                marker=dict(color=vm["历史分位"], colorscale="RdYlGn_r", cmin=0, cmax=100,
+                            line=dict(color="#ffffff", width=1)),
+                text=[f"{v:.0f}%" for v in vm["历史分位"]], textposition="outside",
+                hovertemplate="%{y}<br>历史分位 %{x:.1f}%<extra></extra>",
+            ))
+            fig_vm.add_vline(x=50, line_dash="dash", line_color="#9ca3af")
+            fig_vm.update_layout(
+                title="当前价在各自历史中的位置（越靠左越便宜）",
+                xaxis_title="历史分位 %", height=470,
+                margin=dict(l=10, r=50, t=50, b=10))
+            st.plotly_chart(fig_vm, width="stretch")
+            st.dataframe(
+                vm, width="stretch", hide_index=True, height=310,
+                column_config={
+                    "历史分位": st.column_config.NumberColumn("历史分位%", format="%.1f"),
+                    "最新价": st.column_config.NumberColumn("最新价", format="%.2f"),
+                    "近一年均价": st.column_config.NumberColumn("近一年均价", format="%.2f"),
+                    "偏离均价": st.column_config.NumberColumn("偏离均价%", format="%+.1f"),
+                })
+            st.caption(f"最便宜：{vm.iloc[0]['品类']}（{vm.iloc[0]['历史分位']:.0f}%）；"
+                       f"最贵：{vm.iloc[-1]['品类']}（{vm.iloc[-1]['历史分位']:.0f}%）。"
+                       "分位 = 历史样本中低于当前价的比例。历史为期货/指数折算口径，"
+                       "与今日批发现价不可直接比绝对值。")
+
+    with tab_sea:
+        sm = seasonal_matrix()
+        if not sm.empty:
+            rel = sm.div(sm.mean(axis=1), axis=0) * 100 - 100
+            fig_sea = go.Figure(go.Heatmap(
+                z=rel.values, x=list(rel.columns), y=list(rel.index),
+                colorscale="RdYlGn_r", zmid=0, colorbar=dict(title="偏离%"),
+                hovertemplate="%{y} · %{x}<br>较常年 %{z:+.1f}%<extra></extra>",
+            ))
+            fig_sea.update_layout(
+                title="月度均价相对自身常年水平（绿色 = 便宜窗口）",
+                height=520, xaxis_title="月份",
+                margin=dict(l=10, r=20, t=50, b=10))
+            st.plotly_chart(fig_sea, width="stretch")
+            cal = []
+            for name, row in sm.iterrows():
+                cal.append(dict(品类=name, 最便宜月=str(row.idxmin()),
+                                最贵月=str(row.idxmax()),
+                                年内价差=round((float(row.max()) / float(row.min()) - 1) * 100, 1)))
+            df_cal = pd.DataFrame(cal)
+            df_cal["_m"] = df_cal["最便宜月"].str.replace("月", "", regex=False).astype(int)
+            df_cal = df_cal.sort_values("_m").drop(columns="_m")
+            st.dataframe(df_cal, width="stretch", hide_index=True, height=330)
+            st.caption("读法：例如猪肉 12 月均价最低、5 月最高；价差越大，错峰采购越划算。"
+                       "季节性由各品类全历史月度均价归集，未剔除长期趋势，仅作课程演示。")
+
+    with tab_risk:
+        risks = []
+        for name, df in allh.items():
+            v, mdd, yoy = risk_metrics(df)
+            if np.isfinite(v):
+                risks.append(dict(品类=name, 年化波动率=round(v, 1),
+                                  最大回撤=round(mdd, 1), 近一年涨跌=round(yoy, 1)))
+        df_risk = pd.DataFrame(risks).sort_values("年化波动率", ascending=False)
+        if not df_risk.empty:
+            fig_risk = px.bar(
+                df_risk.sort_values("年化波动率"), x="年化波动率", y="品类", orientation="h",
+                color="年化波动率", color_continuous_scale="Reds",
+                title="年化波动率排行（越红越不稳）", labels={"年化波动率": "年化波动率 %"})
+            fig_risk.update_layout(height=470, margin=dict(l=10, r=20, t=50, b=10))
+            st.plotly_chart(fig_risk, width="stretch")
+            st.dataframe(df_risk, width="stretch", hide_index=True, height=320)
+            stable, wild = df_risk.iloc[-1], df_risk.iloc[0]
+            st.caption(f"**{stable['品类']}** 波动最小（{stable['年化波动率']:.0f}%），适合囤；"
+                       f"**{wild['品类']}** 波动最大（{wild['年化波动率']:.0f}%），建议少量多次买。"
+                       "最大回撤按历史高点到低点计算，不代表未来风险。")
+
+    with tab_corr:
+        cm = corr_matrix()
+        if cm is not None and cm.shape[0] > 2:
+            fig_cm = go.Figure(go.Heatmap(
+                z=cm.values, x=list(cm.columns), y=list(cm.index),
+                colorscale="RdBu_r", zmin=-1, zmax=1, colorbar=dict(title="r"),
+                hovertemplate="%{y} × %{x}<br>r = %{z:.2f}<extra></extra>"))
+            fig_cm.update_layout(
+                height=580, title="月度收益率相关系数（红=同涨同跌，蓝=反向）",
+                margin=dict(l=10, r=20, t=50, b=10))
+            st.plotly_chart(fig_cm, width="stretch")
+            cols, pairs = list(cm.columns), []
+            for i in range(len(cols)):
+                for j in range(i + 1, len(cols)):
+                    v = cm.iloc[i, j]
+                    if pd.notna(v) and np.isfinite(v):
+                        pairs.append(dict(品类A=cols[i], 品类B=cols[j],
+                                          相关系数=round(float(v), 2)))
+            df_pairs = pd.DataFrame(pairs)
+            if not df_pairs.empty:
+                df_pairs["_a"] = df_pairs["相关系数"].abs()
+                df_pairs = df_pairs.sort_values("_a", ascending=False).drop(columns="_a").head(8)
+                st.dataframe(df_pairs, width="stretch", hide_index=True, height=300)
+            st.caption("Pearson 相关，样本至少 24 个月。油脂类（豆油/棕榈油/菜籽油）同步性高，"
+                       "说明它们受同一批原料与政策驱动，互相替代空间有限；强负相关品类则天然可对冲。")
+
+    with tab_fc:
+        fc1, fc2 = st.columns([1, 3])
+        with fc1:
+            fchoice = st.selectbox("选择预测品类", list(labels6.keys()), key="fc_pick")
+            st.caption("课程级线性回归外推（最近 120 个交易日 + 噪声区间），"
+                       "仅供演示，不构成投资或采购建议。")
+        key_f, emo_f, name_f, conv_f = labels6[fchoice]
+        fdf, flast, _, _ = load_hist(key_f, conv_f)
+        if not fdf.empty and len(fdf) > 60:
+            pred, lo, hi, slope, n = forecast_price(fdf, 30)
+            fm1, fm2, fm3 = st.columns(3)
+            with fm1:
+                metric_card(f"{emo_f} 当前价", f"{flast}", None, note="历史序列最新值")
+            with fm2:
+                metric_card("🔮 30日后预测", f"{pred:.2f}", pred - flast,
+                            " 元/公斤" if conv_f != 1 else " 点", False, "线性回归外推")
+            with fm3:
+                metric_card("📏 95%区间", f"{lo:.2f} ~ {hi:.2f}", None,
+                            note=f"基于最近 {n} 个交易日残差")
+            recent = fdf.tail(180)
+            future_dates = pd.date_range(recent["date"].iloc[-1], periods=31, freq="D")[1:]
+            fig_fc = go.Figure()
+            fig_fc.add_trace(go.Scatter(x=recent["date"], y=recent["price"],
+                                        mode="lines", name="历史价",
+                                        line=dict(color="#2F7A5B", width=2)))
+            fig_fc.add_trace(go.Scatter(
+                x=list(future_dates) + list(future_dates[::-1]),
+                y=[hi] * 30 + [lo] * 30, fill="toself",
+                fillcolor="rgba(232,131,58,0.16)", line=dict(color="rgba(0,0,0,0)"),
+                name="95% 区间", hoverinfo="skip"))
+            fig_fc.add_trace(go.Scatter(x=future_dates, y=[pred] * 30,
+                                        mode="lines", name="30日预测",
+                                        line=dict(color="#E8833A", width=2, dash="dash")))
+            fig_fc.add_vline(x=recent["date"].iloc[-1], line_dash="dot", line_color="#9ca3af")
+            fig_fc.update_layout(
+                title=f"{name_f}：历史 180 天 + 未来 30 天推演", height=420,
+                margin=dict(l=20, r=20, t=50, b=20),
+                legend=dict(orientation="h", y=1.12, x=0),
+                yaxis_title="价格(元/公斤)" if conv_f != 1 else "指数")
+            st.plotly_chart(fig_fc, width="stretch")
+            trend = "上行" if slope > 0.005 else ("下行" if slope < -0.005 else "横盘")
+            st.info(f"📈 模型判断：近 {n} 个交易日呈**{trend}**趋势（日均斜率 {slope:+.4f}）。"
+                    f"未来 30 天中心预测 **{pred:.2f}**，区间 **{lo:.2f} ~ {hi:.2f}**。")
 
     # ───────── 模块五：区域解读 ─────────
     st.header("🗺️ 四大区域菜价解读", divider="green")
