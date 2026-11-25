@@ -355,15 +355,16 @@ def metric_card(title, value, delta=None, unit="", up_is_good=False, note=""):
         color = "#1e8449" if good else "#c0392b"
         arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "＝")
         delta_text = f"{arrow} {abs(delta):,.2f}{unit}"
-    st.markdown(f"""
-    <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;
-                padding:14px 16px;min-height:104px;">
-      <div style="font-size:13px;color:#6b7280;">{title}</div>
-      <div style="font-size:25px;font-weight:750;color:#111827;line-height:1.25;margin:4px 0;">{value}</div>
-      <div style="font-size:13px;font-weight:650;color:{color};">{delta_text}</div>
-      <div style="font-size:11px;color:#9ca3af;margin-top:3px;">{note}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    html = (
+        f'<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:14px 16px;min-height:104px;">'
+        f'<div style="font-size:13px;color:#6b7280;">{title}</div>'
+        f'<div style="font-size:25px;font-weight:750;color:#111827;line-height:1.25;margin:4px 0;">{value}</div>'
+        f'<div style="font-size:13px;font-weight:650;color:{color};">{delta_text}</div>'
+        f'<div style="font-size:11px;color:#9ca3af;margin-top:3px;">{note}</div>'
+        '</div>'
+    )
+    # 去掉首尾空白：否则 Streamlit 重渲染时 React 会因多余文本节点报 removeChild 错
+    st.markdown(html.strip(), unsafe_allow_html=True)
 
 
 def main():
